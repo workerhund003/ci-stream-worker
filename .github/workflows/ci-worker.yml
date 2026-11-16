@@ -1,0 +1,74 @@
+name: Twitch Live Capture Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      streamer:
+        description: "Usuário da Twitch (ex: alanzoka)"
+        required: true
+        default: "alanzoka"
+        type: string
+      qualidade:
+        description: "Qualidade do streamlink (ex: best, 1080p60, 720p60)"
+        required: true
+        default: "best"
+        type: string
+      tempo_corte:
+        description: "Duração de cada corte em segundos (900 = 15 min)"
+        required: true
+        default: "900"
+        type: string
+      projeto_drive:
+        description: "Subpasta de projeto em Youtube-Farm-Clips/"
+        required: false
+        default: "TWITCH_LIVES"
+        type: string
+
+jobs:
+  capture:
+    name: "Captura Bloco ${{ matrix.bloco }} (${{ inputs.streamer }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      matrix:
+        bloco: [1, 2]
+      max-parallel: 1
+      fail-fast: false
+
+    env:
+      TZ: America/Sao_Paulo
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout worker repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install FFmpeg, Streamlink & Drive dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --upgrade -q pip
+          python3 -m pip install -q -r requirements.txt
+          ffmpeg -version | head -n 2
+          streamlink --version
+
+      - name: Capture live segments and upload to Google Drive
+        env:
+          GDRIVE_TOKEN_JSON_B64: ${{ secrets.GDRIVE_TOKEN_JSON_B64 }}
+        run: |
+          mkdir -p /tmp/ci_capture
+          timeout -s TERM -k 120s 21360s python3 worker_capture.py \
+            --streamer "${{ inputs.streamer }}" \
+            --quality "${{ inputs.qualidade }}" \
+            --segment-seconds "${{ inputs.tempo_corte }}" \
+            --project-folder "${{ inputs.projeto_drive }}" \
+            --drive-root "Youtube-Farm-Clips" \
+            --block "${{ matrix.bloco }}" \
+            --max-runtime-seconds 20880 \
+            --offline-wait-seconds 180 \
+            --temp-dir "/tmp/ci_capture"

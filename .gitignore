@@ -1,0 +1,29 @@
+# Secrets & credentials (NEVER commit!)
+rclone.conf
+*.conf
+.env
+.env.*
+*.env
+*.token
+*.key
+*.pem
+*secret*.json
+*token*.json
+credentials.json
+client_secret*.json
+
+# Media & temporary files
+*.mp4
+*.mkv
+*.ts
+*.part
+*.tmp
+concluidos.txt
+tmp/
+buffer/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
