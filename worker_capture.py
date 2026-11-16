@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -23,17 +24,22 @@ from zoneinfo import ZoneInfo
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaInMemoryUpload
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 BRT_TZ = ZoneInfo("America/Sao_Paulo")
 TS_SEG_RE = re.compile(r"_seg(\d+)\.ts$")
 TWITCH_LOGIN_RE = re.compile(r"^[a-z0-9_]{2,32}$")
 
+_ACTIVE_LOG_SINK: Any = None
+
 
 def log(msg: str) -> None:
     ts = datetime.now(BRT_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-    print(f"[{ts}] {msg}", flush=True)
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    if _ACTIVE_LOG_SINK is not None:
+        _ACTIVE_LOG_SINK.append(line)
 
 
 def normalize_streamer(raw: str) -> str:
@@ -232,16 +238,19 @@ class DriveUploader:
         )
         return str(created["id"])
 
+    def ensure_folder_path(self, parts: list[str]) -> str:
+        parent_id: str | None = None
+        for part in parts:
+            parent_id = self._find_or_create_folder(part, parent_id)
+        assert parent_id is not None
+        return parent_id
+
     def ensure_target_folder(self) -> str:
         with self._lock:
             if self._target_folder_id:
                 return self._target_folder_id
-            parent_id: str | None = None
-            for part in self.drive_folder_parts:
-                parent_id = self._find_or_create_folder(part, parent_id)
-            assert parent_id is not None
-            self._target_folder_id = parent_id
-            return parent_id
+            self._target_folder_id = self.ensure_folder_path(self.drive_folder_parts)
+            return self._target_folder_id
 
     def _find_existing_file(self, folder_id: str, filename: str) -> dict[str, Any] | None:
         escaped = filename.replace("'", "\\'")
@@ -357,6 +366,76 @@ class DriveUploader:
         raise RuntimeError(f"Falha definitiva no upload de '{mp4_path.name}': {last_err}")
 
 
+class DriveLiveLogSink:
+    """Maintains a throttled live log file in Google Drive for real-time monitoring."""
+
+    def __init__(
+        self,
+        uploader: DriveUploader,
+        streamer_folder_parts: list[str],
+        filename: str,
+        flush_interval_seconds: float = 20.0,
+        max_lines: int = 120,
+    ) -> None:
+        self.uploader = uploader
+        self.streamer_folder_parts = streamer_folder_parts
+        self.filename = filename
+        self.flush_interval_seconds = flush_interval_seconds
+        self._lines: deque[str] = deque(maxlen=max_lines)
+        self._lock = threading.Lock()
+        self._folder_id: str | None = None
+        self._file_id: str | None = None
+        self._last_flush = 0.0
+        self._dirty = False
+
+    def append(self, line: str) -> None:
+        with self._lock:
+            self._lines.append(line)
+            self._dirty = True
+
+    def flush(self, *, force: bool = False) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            now = time.monotonic()
+            if not force and (now - self._last_flush) < self.flush_interval_seconds:
+                return
+            payload = ("\n".join(self._lines) + "\n").encode("utf-8")
+            self._dirty = False
+            self._last_flush = now
+
+        try:
+            if self._folder_id is None:
+                self._folder_id = self.uploader.ensure_folder_path(self.streamer_folder_parts)
+            if self._file_id is None:
+                existing = self.uploader._find_existing_file(self._folder_id, self.filename)
+                if existing and existing.get("id"):
+                    self._file_id = str(existing["id"])
+            media = MediaInMemoryUpload(payload, mimetype="text/plain", resumable=False)
+            if self._file_id is None:
+                created = (
+                    self.uploader.service.files()
+                    .create(
+                        body={"name": self.filename, "parents": [self._folder_id]},
+                        media_body=media,
+                        fields="id",
+                        supportsAllDrives=True,
+                    )
+                    .execute()
+                )
+                self._file_id = str(created["id"])
+            else:
+                self.uploader.service.files().update(
+                    fileId=self._file_id,
+                    media_body=media,
+                    fields="id",
+                    supportsAllDrives=True,
+                ).execute()
+        except Exception:
+            # Never interfere with capture/upload if live status mirror fails transiently.
+            pass
+
+
 def probe_twitch_live(streamer: str, *, streamlink_bin: str = "streamlink") -> dict[str, Any]:
     url = f"https://www.twitch.tv/{streamer}"
     proc = subprocess.run(
@@ -394,11 +473,23 @@ def probe_twitch_live(streamer: str, *, streamlink_bin: str = "streamlink") -> d
 
 
 def _drain_stderr(pipe: Any, label: str) -> None:
+    last_txt = ""
+    suppressed = 0
     try:
         for line in iter(pipe.readline, b""):
             txt = line.decode("utf-8", errors="replace").strip()
-            if txt:
-                log(f"[{label}] {txt}")
+            if not txt:
+                continue
+            if txt == last_txt:
+                suppressed += 1
+                continue
+            if suppressed > 0:
+                log(f"[{label}] (mensagem anterior repetida {suppressed}x)")
+                suppressed = 0
+            last_txt = txt
+            log(f"[{label}] {txt}")
+        if suppressed > 0:
+            log(f"[{label}] (mensagem anterior repetida {suppressed}x)")
     except Exception:
         pass
     finally:
@@ -435,14 +526,24 @@ def run_worker(
     uploader = DriveUploader(drive_service, drive_parts)
     probe_impl = probe_fn or (lambda s: probe_twitch_live(s, streamlink_bin=streamlink_bin))
 
+    global _ACTIVE_LOG_SINK
+    log_sink = DriveLiveLogSink(
+        uploader=uploader,
+        streamer_folder_parts=[drive_root, norm_project, norm_streamer],
+        filename=f"worker_live_bloco{block_num}.log",
+    )
+    _ACTIVE_LOG_SINK = log_sink
+
     log(f"Iniciando CI Stream Worker | streamer={norm_streamer} qualidade={quality} corte={segment_seconds}s bloco={block_num}")
     log(f"Destino Google Drive: {'/'.join(drive_parts)}")
 
     try:
         target_folder_id = uploader.ensure_target_folder()
         log(f"Pasta Drive pronta (folder_id={target_folder_id})")
+        log_sink.flush(force=True)
     except Exception as exc:
         log(f"[ERRO DRIVE INIT] Falha ao preparar pasta no Google Drive: {exc}")
+        _ACTIVE_LOG_SINK = None
         return 1
 
     stop_event = threading.Event()
@@ -479,10 +580,12 @@ def run_worker(
                 mp4_path.unlink(missing_ok=True)
                 uploaded_count["n"] += 1
                 log(f"[UPLOAD OK + LIMPEZA LOCAL] {mp4_path.name} -> Drive ID {file_id}")
+                log_sink.flush(force=True)
             except Exception as exc:
                 failed_retention.append(mp4_path)
                 upload_failures.append(f"{mp4_path.name}: {exc}")
                 log(f"[UPLOAD FALHOU - MANTIDO LOCALMENTE] {mp4_path.name}: {exc}")
+                log_sink.flush(force=True)
             finally:
                 upload_queue.task_done()
 
@@ -554,8 +657,6 @@ def run_worker(
                 "-loglevel",
                 "warning",
                 "-y",
-                "-f",
-                "mpegts",
                 "-i",
                 "pipe:0",
                 "-c",
@@ -625,14 +726,26 @@ def run_worker(
                             f"[CORTE PRONTO] {mp4_name} | dur={meta['duration']}s | "
                             f"video={meta['has_video']} audio={meta['has_audio']}"
                         )
+                        log_sink.flush(force=True)
                         upload_queue.put((mp4_path, meta))
                         global_part += 1
                     except Exception as exc:
                         log(f"[REMUX ERRO] {ts_p.name}: {exc}")
 
+            last_heartbeat = time.monotonic()
             try:
                 while True:
                     _process_ts(flush_all=False)
+                    now_hb = time.monotonic()
+                    if (now_hb - last_heartbeat) >= 30.0:
+                        free_gb = shutil.disk_usage(temp_dir).free / (1024 * 1024 * 1024)
+                        log(
+                            f"[HEARTBEAT] bloco={block_num} ativo={int(now_hb - start_mono)}s | "
+                            f"uploads_ok={uploaded_count['n']} | fila={upload_queue.qsize()} | "
+                            f"disco_livre={free_gb:.2f}GB"
+                        )
+                        last_heartbeat = now_hb
+                    log_sink.flush(force=False)
                     if stop_event.is_set() or (time.monotonic() - start_mono) >= max_runtime_seconds:
                         break
                     if shutil.disk_usage(temp_dir).free < 1024 * 1024 * 1024:
@@ -691,6 +804,8 @@ def run_worker(
             f"Bloco {block_num} finalizado | uploads_confirmados={uploaded_count['n']} | "
             f"falhas_upload={len(upload_failures)}"
         )
+        log_sink.flush(force=True)
+        _ACTIVE_LOG_SINK = None
 
     return 1 if upload_failures else 0
 
