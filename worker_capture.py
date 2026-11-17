@@ -26,6 +26,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaInMemoryUpload
 
+import resumable_uploader
+
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 BRT_TZ = ZoneInfo("America/Sao_Paulo")
 TS_SEG_RE = re.compile(r"_seg(\d+)\.ts$")
@@ -170,11 +172,11 @@ def remux_ts_to_mp4(
     }
 
 
-def load_drive_service_from_env(
+def load_drive_credentials_from_env(
     *,
     token_env: str = "GDRIVE_TOKEN_JSON_B64",
     token_file: Path | None = None,
-) -> Any:
+) -> Credentials:
     raw_b64 = os.environ.get(token_env, "").strip()
     if raw_b64:
         token_json_text = base64.b64decode(raw_b64).decode("utf-8")
@@ -189,17 +191,38 @@ def load_drive_service_from_env(
 
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
+    return creds
+
+
+def load_drive_service_from_env(
+    *,
+    token_env: str = "GDRIVE_TOKEN_JSON_B64",
+    token_file: Path | None = None,
+) -> Any:
+    creds = load_drive_credentials_from_env(token_env=token_env, token_file=token_file)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 class DriveUploader:
     """Google Drive resumable uploader with folder hierarchy, dedup, and MD5 verification."""
 
-    def __init__(self, service: Any, drive_folder_parts: list[str]) -> None:
-        self.service = service
+    def __init__(
+        self,
+        service: Any,
+        drive_folder_parts: list[str],
+        *,
+        credentials: Credentials | None = None,
+    ) -> None:
+        self.credentials = credentials
+        self.service = (
+            build("drive", "v3", credentials=credentials, cache_discovery=False)
+            if credentials is not None
+            else service
+        )
         self.drive_folder_parts = drive_folder_parts
         self._target_folder_id: str | None = None
         self._lock = threading.Lock()
+        self._creds_lock = threading.Lock()
 
     def _find_or_create_folder(self, name: str, parent_id: str | None) -> str:
         escaped = name.replace("'", "\\'")
@@ -319,31 +342,50 @@ class DriveUploader:
                             fileId=str(existing["id"]), supportsAllDrives=True
                         ).execute()
 
-                body = {
-                    "name": mp4_path.name,
-                    "parents": [folder_id],
-                    "appProperties": {
-                        "pipeline_source": "ci_stream_worker",
-                        "duration_seconds": str(meta.get("duration", "")),
-                    },
+                app_props = {
+                    "pipeline_source": "ci_stream_worker",
+                    "duration_seconds": str(meta.get("duration", "")),
                 }
-                media = MediaFileUpload(
-                    str(mp4_path),
-                    mimetype="video/mp4",
-                    chunksize=8 * 1024 * 1024,
-                    resumable=True,
-                )
-                req = self.service.files().create(
-                    body=body,
-                    media_body=media,
-                    fields="id, name, size, md5Checksum",
-                    supportsAllDrives=True,
-                )
-                response = None
-                while response is None:
-                    _status, response = req.next_chunk(num_retries=3)
+                if self.credentials is not None:
+                    with self._creds_lock:
+                        if self.credentials.expired and self.credentials.refresh_token:
+                            self.credentials.refresh(Request())
+                    with mp4_path.open("rb") as fh:
+                        up_res = resumable_uploader.stream_to_drive(
+                            creds=self.credentials,
+                            stream=fh,
+                            name=mp4_path.name,
+                            folder_id=folder_id,
+                            mime_type="video/mp4",
+                            app_properties=app_props,
+                            chunk_size=8 * 1024 * 1024,
+                            max_retries=5,
+                            timeout_s=120.0,
+                        )
+                    file_id = str(up_res.file_metadata.get("id") or "")
+                else:
+                    body = {
+                        "name": mp4_path.name,
+                        "parents": [folder_id],
+                        "appProperties": app_props,
+                    }
+                    media = MediaFileUpload(
+                        str(mp4_path),
+                        mimetype="video/mp4",
+                        chunksize=8 * 1024 * 1024,
+                        resumable=True,
+                    )
+                    req = self.service.files().create(
+                        body=body,
+                        media_body=media,
+                        fields="id, name, size, md5Checksum",
+                        supportsAllDrives=True,
+                    )
+                    response = None
+                    while response is None:
+                        _status, response = req.next_chunk(num_retries=3)
+                    file_id = str((response or {}).get("id") or "")
 
-                file_id = str((response or {}).get("id") or "")
                 if not file_id:
                     raise RuntimeError("Upload retornou resposta sem file ID.")
                 self._verify_remote(
@@ -360,6 +402,8 @@ class DriveUploader:
                     f"[UPLOAD ERRO] {mp4_path.name} tentativa {attempt}/{max_retries}: {exc}. "
                     f"Tentando novamente em {backoff}s..."
                 )
+                if self.credentials is not None:
+                    self.service = build("drive", "v3", credentials=self.credentials, cache_discovery=False)
                 if attempt < max_retries:
                     time.sleep(backoff)
 
@@ -378,11 +422,18 @@ class DriveLiveLogSink:
         max_lines: int = 120,
     ) -> None:
         self.uploader = uploader
+        # Dedicated Drive service so httplib2 never shares sockets with the upload thread.
+        self._service = (
+            build("drive", "v3", credentials=uploader.credentials, cache_discovery=False)
+            if uploader.credentials is not None
+            else uploader.service
+        )
         self.streamer_folder_parts = streamer_folder_parts
         self.filename = filename
         self.flush_interval_seconds = flush_interval_seconds
         self._lines: deque[str] = deque(maxlen=max_lines)
         self._lock = threading.Lock()
+        self._http_lock = threading.Lock()
         self._folder_id: str | None = None
         self._file_id: str | None = None
         self._last_flush = 0.0
@@ -392,6 +443,39 @@ class DriveLiveLogSink:
         with self._lock:
             self._lines.append(line)
             self._dirty = True
+
+    def _find_or_create_folder_local(self, name: str, parent_id: str | None) -> str:
+        escaped = name.replace("'", "\\'")
+        q_parts = [
+            "mimeType = 'application/vnd.google-apps.folder'",
+            f"name = '{escaped}'",
+            "trashed = false",
+        ]
+        if parent_id:
+            q_parts.append(f"'{parent_id}' in parents")
+        res = (
+            self._service.files()
+            .list(
+                q=" and ".join(q_parts),
+                fields="files(id, name)",
+                pageSize=5,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        files = res.get("files") or []
+        if files:
+            return str(files[0]["id"])
+        body: dict[str, Any] = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+        if parent_id:
+            body["parents"] = [parent_id]
+        created = (
+            self._service.files()
+            .create(body=body, fields="id, name", supportsAllDrives=True)
+            .execute()
+        )
+        return str(created["id"])
 
     def flush(self, *, force: bool = False) -> None:
         with self._lock:
@@ -404,36 +488,52 @@ class DriveLiveLogSink:
             self._dirty = False
             self._last_flush = now
 
-        try:
-            if self._folder_id is None:
-                self._folder_id = self.uploader.ensure_folder_path(self.streamer_folder_parts)
-            if self._file_id is None:
-                existing = self.uploader._find_existing_file(self._folder_id, self.filename)
-                if existing and existing.get("id"):
-                    self._file_id = str(existing["id"])
-            media = MediaInMemoryUpload(payload, mimetype="text/plain", resumable=False)
-            if self._file_id is None:
-                created = (
-                    self.uploader.service.files()
-                    .create(
-                        body={"name": self.filename, "parents": [self._folder_id]},
+        with self._http_lock:
+            try:
+                if self._folder_id is None:
+                    parent_id: str | None = None
+                    for part in self.streamer_folder_parts:
+                        parent_id = self._find_or_create_folder_local(part, parent_id)
+                    self._folder_id = parent_id
+                if self._file_id is None and self._folder_id is not None:
+                    escaped = self.filename.replace("'", "\\'")
+                    res = (
+                        self._service.files()
+                        .list(
+                            q=f"name = '{escaped}' and '{self._folder_id}' in parents and trashed = false",
+                            fields="files(id, name)",
+                            pageSize=5,
+                            supportsAllDrives=True,
+                            includeItemsFromAllDrives=True,
+                        )
+                        .execute()
+                    )
+                    existing = res.get("files") or []
+                    if existing and existing[0].get("id"):
+                        self._file_id = str(existing[0]["id"])
+                media = MediaInMemoryUpload(payload, mimetype="text/plain", resumable=False)
+                if self._file_id is None:
+                    created = (
+                        self._service.files()
+                        .create(
+                            body={"name": self.filename, "parents": [self._folder_id]},
+                            media_body=media,
+                            fields="id",
+                            supportsAllDrives=True,
+                        )
+                        .execute()
+                    )
+                    self._file_id = str(created["id"])
+                else:
+                    self._service.files().update(
+                        fileId=self._file_id,
                         media_body=media,
                         fields="id",
                         supportsAllDrives=True,
-                    )
-                    .execute()
-                )
-                self._file_id = str(created["id"])
-            else:
-                self.uploader.service.files().update(
-                    fileId=self._file_id,
-                    media_body=media,
-                    fields="id",
-                    supportsAllDrives=True,
-                ).execute()
-        except Exception:
-            # Never interfere with capture/upload if live status mirror fails transiently.
-            pass
+                    ).execute()
+            except Exception:
+                # Never interfere with capture/upload if live status mirror fails transiently.
+                pass
 
 
 def probe_twitch_live(streamer: str, *, streamlink_bin: str = "streamlink") -> dict[str, Any]:
@@ -510,7 +610,8 @@ def run_worker(
     max_runtime_seconds: int,
     offline_wait_seconds: int,
     temp_dir: Path,
-    drive_service: Any,
+    drive_service: Any = None,
+    credentials: Credentials | None = None,
     probe_fn: Callable[[str], dict[str, Any]] | None = None,
     producer_cmd_factory: Callable[[str, str], list[str]] | None = None,
     ffmpeg_bin: str = "ffmpeg",
@@ -523,7 +624,7 @@ def run_worker(
     drive_parts = [drive_root, norm_project, norm_streamer, "00_ORIGINAIS", today_brt]
 
     temp_dir.mkdir(parents=True, exist_ok=True)
-    uploader = DriveUploader(drive_service, drive_parts)
+    uploader = DriveUploader(drive_service, drive_parts, credentials=credentials)
     probe_impl = probe_fn or (lambda s: probe_twitch_live(s, streamlink_bin=streamlink_bin))
 
     global _ACTIVE_LOG_SINK
@@ -562,32 +663,52 @@ def run_worker(
     upload_queue: queue.Queue[tuple[Path, dict[str, Any]] | None] = queue.Queue()
     upload_failures: list[str] = []
     uploaded_count = {"n": 0}
-    failed_retention: list[Path] = []
+    retry_buffer: deque[tuple[Path, dict[str, Any], float]] = deque()
+
+    def _try_upload_item(mp4_path: Path, meta: dict[str, Any]) -> bool:
+        try:
+            log(
+                f"[UPLOAD INICIADO] {mp4_path.name} "
+                f"({meta['size_bytes'] / (1024 * 1024):.2f} MB | {meta['duration']}s)"
+            )
+            file_id = uploader.upload_and_verify(mp4_path, meta, max_retries=5)
+            mp4_path.unlink(missing_ok=True)
+            uploaded_count["n"] += 1
+            log(f"[UPLOAD OK + LIMPEZA LOCAL] {mp4_path.name} -> Drive ID {file_id}")
+            log_sink.flush(force=True)
+            return True
+        except Exception as exc:
+            log(f"[UPLOAD FALHOU - REAGENDADO LOCALMENTE] {mp4_path.name}: {exc}")
+            log_sink.flush(force=True)
+            return False
 
     def _upload_worker() -> None:
         while True:
-            item = upload_queue.get()
+            try:
+                item = upload_queue.get(timeout=15.0)
+            except queue.Empty:
+                now_t = time.monotonic()
+                if retry_buffer and now_t >= retry_buffer[0][2]:
+                    mp4_p, m_info, _due = retry_buffer.popleft()
+                    if mp4_p.is_file() and not _try_upload_item(mp4_p, m_info):
+                        retry_buffer.append((mp4_p, m_info, time.monotonic() + 60.0))
+                continue
+
             if item is None:
                 upload_queue.task_done()
                 break
             mp4_path, meta = item
             try:
-                log(
-                    f"[UPLOAD INICIADO] {mp4_path.name} "
-                    f"({meta['size_bytes'] / (1024 * 1024):.2f} MB | {meta['duration']}s)"
-                )
-                file_id = uploader.upload_and_verify(mp4_path, meta, max_retries=5)
-                mp4_path.unlink(missing_ok=True)
-                uploaded_count["n"] += 1
-                log(f"[UPLOAD OK + LIMPEZA LOCAL] {mp4_path.name} -> Drive ID {file_id}")
-                log_sink.flush(force=True)
-            except Exception as exc:
-                failed_retention.append(mp4_path)
-                upload_failures.append(f"{mp4_path.name}: {exc}")
-                log(f"[UPLOAD FALHOU - MANTIDO LOCALMENTE] {mp4_path.name}: {exc}")
-                log_sink.flush(force=True)
+                if not _try_upload_item(mp4_path, meta):
+                    retry_buffer.append((mp4_path, meta, time.monotonic() + 60.0))
             finally:
                 upload_queue.task_done()
+
+        # Final retry pass before ending block.
+        while retry_buffer:
+            mp4_p, m_info, _due = retry_buffer.popleft()
+            if mp4_p.is_file() and not _try_upload_item(mp4_p, m_info):
+                upload_failures.append(mp4_p.name)
 
     up_thread = threading.Thread(target=_upload_worker, name="drive-uploader", daemon=False)
     up_thread.start()
@@ -829,7 +950,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     token_file = Path(args.token_file) if args.token_file else None
-    drive_service = load_drive_service_from_env(
+    creds = load_drive_credentials_from_env(
         token_env=args.token_env,
         token_file=token_file,
     )
@@ -843,7 +964,7 @@ def main(argv: list[str] | None = None) -> int:
         max_runtime_seconds=args.max_runtime_seconds,
         offline_wait_seconds=args.offline_wait_seconds,
         temp_dir=Path(args.temp_dir),
-        drive_service=drive_service,
+        credentials=creds,
     )
 
 
