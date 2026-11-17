@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -599,6 +599,52 @@ def _drain_stderr(pipe: Any, label: str) -> None:
             pass
 
 
+def _parse_watch_until(raw: str) -> datetime | None:
+    val = str(raw or "").strip()
+    if not val:
+        return None
+    dt = datetime.fromisoformat(val)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=BRT_TZ)
+    return dt.astimezone(BRT_TZ)
+
+
+def _write_github_output(output_file: Path | None, values: dict[str, str]) -> None:
+    if output_file is None:
+        return
+    try:
+        with output_file.open("a", encoding="utf-8") as fh:
+            for k, v in values.items():
+                fh.write(f"{k}={v}\n")
+    except OSError as exc:
+        log(f"[AVISO OUTPUT] Não foi possível gravar GITHUB_OUTPUT: {exc}")
+
+
+def _wait_interruptible(
+    stop_event: threading.Event,
+    seconds: float,
+    *,
+    watch_until_dt: datetime | None,
+    start_mono: float,
+    max_runtime_seconds: int,
+    log_sink: DriveLiveLogSink | None = None,
+) -> str | None:
+    """Sleep up to `seconds` in short increments, returning stop reason early if triggered."""
+    end_t = time.monotonic() + max(0.0, seconds)
+    while not stop_event.is_set():
+        if watch_until_dt is not None and datetime.now(BRT_TZ) >= watch_until_dt:
+            return "watch_until_reached"
+        if (time.monotonic() - start_mono) >= max_runtime_seconds:
+            return "block_time_limit"
+        if log_sink is not None:
+            log_sink.flush(force=False)
+        remaining = end_t - time.monotonic()
+        if remaining <= 0:
+            return None
+        stop_event.wait(timeout=min(5.0, remaining))
+    return "signal_received"
+
+
 def run_worker(
     *,
     streamer: str,
@@ -612,6 +658,10 @@ def run_worker(
     temp_dir: Path,
     drive_service: Any = None,
     credentials: Credentials | None = None,
+    wait_poll_seconds: int = 90,
+    watch_until_iso: str = "",
+    stream_already_started: bool = False,
+    github_output_file: Path | None = None,
     probe_fn: Callable[[str], dict[str, Any]] | None = None,
     producer_cmd_factory: Callable[[str, str], list[str]] | None = None,
     ffmpeg_bin: str = "ffmpeg",
@@ -620,6 +670,7 @@ def run_worker(
 ) -> int:
     norm_streamer = normalize_streamer(streamer)
     norm_project = sanitize_folder_name(project_folder)
+    watch_until_dt = _parse_watch_until(watch_until_iso)
     today_brt = datetime.now(BRT_TZ).strftime("%Y-%m-%d")
     drive_parts = [drive_root, norm_project, norm_streamer, "00_ORIGINAIS", today_brt]
 
@@ -635,7 +686,12 @@ def run_worker(
     )
     _ACTIVE_LOG_SINK = log_sink
 
-    log(f"Iniciando CI Stream Worker | streamer={norm_streamer} qualidade={quality} corte={segment_seconds}s bloco={block_num}")
+    limit_desc = watch_until_dt.strftime("%d/%m/%Y %H:%M:%S %Z") if watch_until_dt else "sem limite fixo (até fim da live/bloco)"
+    log(
+        f"Iniciando CI Stream Worker | streamer={norm_streamer} qualidade={quality} "
+        f"corte={segment_seconds}s bloco={block_num} check={wait_poll_seconds}s "
+        f"tolerancia_queda={offline_wait_seconds}s ate='{limit_desc}'"
+    )
     log(f"Destino Google Drive: {'/'.join(drive_parts)}")
 
     try:
@@ -644,6 +700,7 @@ def run_worker(
         log_sink.flush(force=True)
     except Exception as exc:
         log(f"[ERRO DRIVE INIT] Falha ao preparar pasta no Google Drive: {exc}")
+        _write_github_output(github_output_file, {"continue_next": "false", "stream_seen": "false"})
         _ACTIVE_LOG_SINK = None
         return 1
 
@@ -717,11 +774,20 @@ def run_worker(
     global_part = 1
     attempt = 0
     offline_since: float | None = None
+    has_started_stream = bool(stream_already_started)
+    stop_reason = "completed"
+    last_wait_log = 0.0
 
     try:
         while not stop_event.is_set():
+            if watch_until_dt is not None and datetime.now(BRT_TZ) >= watch_until_dt:
+                stop_reason = "watch_until_reached"
+                log(f"[HORÁRIO LIMITE ATINGIDO] Alcançou {watch_until_dt.strftime('%d/%m/%Y %H:%M:%S %Z')}. Encerrando...")
+                break
+
             elapsed = time.monotonic() - start_mono
             if elapsed >= max_runtime_seconds:
+                stop_reason = "block_time_limit"
                 log(f"Tempo limite seguro do bloco atingido ({elapsed:.0f}s >= {max_runtime_seconds}s). Encerrando bloco...")
                 break
 
@@ -736,23 +802,75 @@ def run_worker(
                 now = time.monotonic()
                 if probe_res.get("transient_error"):
                     log(f"[PROBE AVISO] Erro transitório checando {norm_streamer}: {probe_res.get('error')}")
-                    stop_event.wait(timeout=15.0)
+                    early = _wait_interruptible(
+                        stop_event,
+                        min(30, wait_poll_seconds),
+                        watch_until_dt=watch_until_dt,
+                        start_mono=start_mono,
+                        max_runtime_seconds=max_runtime_seconds,
+                        log_sink=log_sink,
+                    )
+                    if early:
+                        stop_reason = early
+                        break
                     continue
+
+                if watch_until_dt is not None and not has_started_stream:
+                    # Antes da live abrir, continua checando a cada wait_poll_seconds (90s) até watch_until.
+                    if (now - last_wait_log) >= max(60, wait_poll_seconds):
+                        log(
+                            f"[AGUARDANDO LIVE] {norm_streamer} offline | próxima checagem em {wait_poll_seconds}s | "
+                            f"limite={watch_until_dt.strftime('%d/%m %H:%M BRT')}"
+                        )
+                        last_wait_log = now
+                    log_sink.flush(force=False)
+                    early = _wait_interruptible(
+                        stop_event,
+                        float(wait_poll_seconds),
+                        watch_until_dt=watch_until_dt,
+                        start_mono=start_mono,
+                        max_runtime_seconds=max_runtime_seconds,
+                        log_sink=log_sink,
+                    )
+                    if early:
+                        stop_reason = early
+                        break
+                    continue
+
+                # Depois que a live já começou (ou sem watch_until), aplica tolerância de queda (ex: 600s = 10 min).
                 if offline_since is None:
                     offline_since = now
-                    log(f"[OFFLINE] Canal {norm_streamer} offline ({probe_res.get('error')}). Aguardando até {offline_wait_seconds}s...")
-                if (now - offline_since) >= offline_wait_seconds:
+                    log(
+                        f"[QUEDA / OFFLINE] {norm_streamer} offline ({probe_res.get('error')}). "
+                        f"Tolerância de até {offline_wait_seconds}s..."
+                    )
+                    log_sink.flush(force=True)
+                elapsed_off = now - offline_since
+                if elapsed_off >= offline_wait_seconds:
+                    stop_reason = "stream_ended_offline"
                     log(f"[OFFLINE CONFIRMADO] {norm_streamer} permaneceu offline por {offline_wait_seconds}s. Encerrando.")
                     break
-                stop_event.wait(timeout=15.0)
+                early = _wait_interruptible(
+                    stop_event,
+                    15.0,
+                    watch_until_dt=watch_until_dt,
+                    start_mono=start_mono,
+                    max_runtime_seconds=max_runtime_seconds,
+                    log_sink=log_sink,
+                )
+                if early:
+                    stop_reason = early
+                    break
                 continue
 
+            has_started_stream = True
             offline_since = None
             attempt += 1
             log(
                 f"[LIVE DETECTADA] {norm_streamer} ao vivo | título='{probe_res.get('title', '')}' | "
                 f"categoria='{probe_res.get('category', '')}' | tentativa={attempt}"
             )
+            log_sink.flush(force=True)
 
             attempt_dir = temp_dir / f"attempt_{attempt:03d}"
             attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -867,7 +985,15 @@ def run_worker(
                         )
                         last_heartbeat = now_hb
                     log_sink.flush(force=False)
-                    if stop_event.is_set() or (time.monotonic() - start_mono) >= max_runtime_seconds:
+                    if watch_until_dt is not None and datetime.now(BRT_TZ) >= watch_until_dt:
+                        stop_reason = "watch_until_reached"
+                        log(f"[HORÁRIO LIMITE ATINGIDO] Interrompendo gravação às {watch_until_dt.strftime('%d/%m/%Y %H:%M:%S %Z')} e enviando trecho final...")
+                        break
+                    if stop_event.is_set():
+                        stop_reason = "signal_received"
+                        break
+                    if (time.monotonic() - start_mono) >= max_runtime_seconds:
+                        stop_reason = "block_time_limit"
                         break
                     if shutil.disk_usage(temp_dir).free < 1024 * 1024 * 1024:
                         log("[DISCO CRÍTICO] Menos de 1 GB livre na VM; pausando captura para preservar cortes pendentes.")
@@ -906,11 +1032,28 @@ def run_worker(
                 ff_log_th.join(timeout=2)
                 _process_ts(flush_all=True)
 
-            if stop_event.is_set() or (time.monotonic() - start_mono) >= max_runtime_seconds:
+            if stop_event.is_set():
+                stop_reason = "signal_received"
+                break
+            if watch_until_dt is not None and datetime.now(BRT_TZ) >= watch_until_dt:
+                stop_reason = "watch_until_reached"
+                break
+            if (time.monotonic() - start_mono) >= max_runtime_seconds:
+                stop_reason = "block_time_limit"
                 break
 
             log("[RECONEXÃO] Processo encerrado antes do limite do bloco; verificando novamente em 15s...")
-            stop_event.wait(timeout=15.0)
+            early = _wait_interruptible(
+                stop_event,
+                15.0,
+                watch_until_dt=watch_until_dt,
+                start_mono=start_mono,
+                max_runtime_seconds=max_runtime_seconds,
+                log_sink=log_sink,
+            )
+            if early:
+                stop_reason = early
+                break
     finally:
         if prev_term is not None and threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGTERM, prev_term)
@@ -921,9 +1064,25 @@ def run_worker(
         upload_queue.put(None)
         up_thread.join()
 
+        should_continue_next = (
+            stop_reason == "block_time_limit"
+            and (
+                watch_until_dt is None
+                or datetime.now(BRT_TZ) < (watch_until_dt - timedelta(seconds=60))
+            )
+        )
+        _write_github_output(
+            github_output_file,
+            {
+                "continue_next": "true" if should_continue_next else "false",
+                "stream_seen": "true" if has_started_stream else "false",
+                "stop_reason": stop_reason,
+            },
+        )
+
         log(
-            f"Bloco {block_num} finalizado | uploads_confirmados={uploaded_count['n']} | "
-            f"falhas_upload={len(upload_failures)}"
+            f"Bloco {block_num} finalizado ({stop_reason}) | continue_next={should_continue_next} | "
+            f"uploads_confirmados={uploaded_count['n']} | falhas_upload={len(upload_failures)}"
         )
         log_sink.flush(force=True)
         _ACTIVE_LOG_SINK = None
@@ -940,7 +1099,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--drive-root", default="Youtube-Farm-Clips")
     p.add_argument("--block", type=int, default=1)
     p.add_argument("--max-runtime-seconds", type=int, default=20880)
-    p.add_argument("--offline-wait-seconds", type=int, default=180)
+    p.add_argument("--offline-wait-seconds", type=int, default=600)
+    p.add_argument("--wait-poll-seconds", type=int, default=90)
+    p.add_argument("--watch-until-iso", default="")
+    p.add_argument("--stream-already-started", action="store_true")
+    p.add_argument("--github-output", default="")
     p.add_argument("--temp-dir", default="/tmp/ci_capture")
     p.add_argument("--token-env", default="GDRIVE_TOKEN_JSON_B64")
     p.add_argument("--token-file", default="")
@@ -950,6 +1113,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     token_file = Path(args.token_file) if args.token_file else None
+    gh_out = Path(args.github_output) if args.github_output else None
     creds = load_drive_credentials_from_env(
         token_env=args.token_env,
         token_file=token_file,
@@ -963,6 +1127,10 @@ def main(argv: list[str] | None = None) -> int:
         block_num=args.block,
         max_runtime_seconds=args.max_runtime_seconds,
         offline_wait_seconds=args.offline_wait_seconds,
+        wait_poll_seconds=args.wait_poll_seconds,
+        watch_until_iso=args.watch_until_iso,
+        stream_already_started=args.stream_already_started,
+        github_output_file=gh_out,
         temp_dir=Path(args.temp_dir),
         credentials=creds,
     )

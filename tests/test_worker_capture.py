@@ -290,6 +290,143 @@ class WorkerCaptureTests(unittest.TestCase):
             ]
             self.assertGreaterEqual(len(mp4s), 2)
 
+    def test_watch_until_stops_capture_at_deadline_and_disables_next_block(self) -> None:
+        from datetime import datetime, timedelta
+
+        fake_service = FakeDriveService()
+        cutoff = datetime.now(worker_capture.BRT_TZ) + timedelta(seconds=3)
+        probes = [{"is_live": True, "title": "Cutoff Test", "category": "Games", "transient_error": False}]
+
+        def producer(_s: str, _q: str) -> list[str]:
+            return [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x180:rate=30:duration=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=10",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "30",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                "-f",
+                "mpegts",
+                "pipe:1",
+            ]
+
+        with tempfile.TemporaryDirectory() as td:
+            gh_out = Path(td) / "gh_output.txt"
+            rc = worker_capture.run_worker(
+                streamer="alanzoka",
+                quality="best",
+                segment_seconds=2,
+                project_folder="TWITCH_LIVES",
+                drive_root="Youtube-Farm-Clips",
+                block_num=1,
+                max_runtime_seconds=60,
+                offline_wait_seconds=600,
+                wait_poll_seconds=1,
+                watch_until_iso=cutoff.isoformat(),
+                github_output_file=gh_out,
+                temp_dir=Path(td) / "tmp",
+                drive_service=fake_service,
+                probe_fn=lambda _s: probes[0],
+                producer_cmd_factory=producer,
+            )
+            self.assertEqual(rc, 0)
+            out_txt = gh_out.read_text(encoding="utf-8")
+            self.assertIn("continue_next=false", out_txt)
+            self.assertIn("stream_seen=true", out_txt)
+            self.assertIn("stop_reason=watch_until_reached", out_txt)
+            mp4s = [
+                v for v in fake_service.files().items.values() if v.get("mimeType") == "video/mp4"
+            ]
+            self.assertGreaterEqual(len(mp4s), 1)
+
+    def test_wait_poll_until_live_opens_then_post_start_offline_tolerance_stops_cleanly(self) -> None:
+        from datetime import datetime, timedelta
+
+        fake_service = FakeDriveService()
+        cutoff = datetime.now(worker_capture.BRT_TZ) + timedelta(minutes=10)
+        probes = [
+            {"is_live": False, "error": "No playable streams found", "transient_error": False},
+            {"is_live": True, "title": "Abriu Live", "category": "Games", "transient_error": False},
+            {"is_live": False, "error": "No playable streams found", "transient_error": False},
+        ]
+
+        def probe_fn(_s: str) -> dict[str, Any]:
+            return probes.pop(0) if len(probes) > 1 else probes[0]
+
+        def producer(_s: str, _q: str) -> list[str]:
+            return [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x180:rate=30:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "30",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                "-f",
+                "mpegts",
+                "pipe:1",
+            ]
+
+        with tempfile.TemporaryDirectory() as td:
+            gh_out = Path(td) / "gh_out.txt"
+            rc = worker_capture.run_worker(
+                streamer="alanzoka",
+                quality="best",
+                segment_seconds=2,
+                project_folder="TWITCH_LIVES",
+                drive_root="Youtube-Farm-Clips",
+                block_num=1,
+                max_runtime_seconds=60,
+                offline_wait_seconds=1,
+                wait_poll_seconds=1,
+                watch_until_iso=cutoff.isoformat(),
+                github_output_file=gh_out,
+                temp_dir=Path(td) / "tmp",
+                drive_service=fake_service,
+                probe_fn=probe_fn,
+                producer_cmd_factory=producer,
+            )
+            self.assertEqual(rc, 0)
+            out_txt = gh_out.read_text(encoding="utf-8")
+            self.assertIn("continue_next=false", out_txt)
+            self.assertIn("stream_seen=true", out_txt)
+            self.assertIn("stop_reason=stream_ended_offline", out_txt)
+
 
 if __name__ == "__main__":
     unittest.main()

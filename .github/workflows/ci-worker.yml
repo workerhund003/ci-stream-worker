@@ -23,41 +23,46 @@ on:
         required: false
         default: "TWITCH_LIVES"
         type: string
+      ate_horario:
+        description: "Horário limite BRT ISO-8601 (opcional, ex: 2026-11-18T02:00:00-03:00)"
+        required: false
+        default: ""
+        type: string
+      tolerancia_queda:
+        description: "Tolerância de queda após live iniciar em segundos (600 = 10 min)"
+        required: false
+        default: "600"
+        type: string
+      intervalo_checagem:
+        description: "Intervalo em segundos checando abertura da live (90 = 1m30s)"
+        required: false
+        default: "90"
+        type: string
 
 jobs:
-  capture:
-    name: "Captura Bloco ${{ matrix.bloco }} (${{ inputs.streamer }})"
+  bloco_1:
+    name: "Captura Bloco 1 (${{ inputs.streamer }})"
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    strategy:
-      matrix:
-        bloco: [1, 2]
-      max-parallel: 1
-      fail-fast: false
-
+    outputs:
+      continue_next: ${{ steps.capture.outputs.continue_next }}
+      stream_seen: ${{ steps.capture.outputs.stream_seen }}
     env:
       TZ: America/Sao_Paulo
       PYTHONUNBUFFERED: "1"
-
     steps:
-      - name: Checkout worker repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install FFmpeg, Streamlink & Drive dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           python3 -m pip install --upgrade -q pip
           python3 -m pip install -q -r requirements.txt
-          ffmpeg -version | head -n 2
-          streamlink --version
-
-      - name: Capture live segments and upload to Google Drive
+      - id: capture
+        name: Capture live segments and upload to Google Drive
         env:
           GDRIVE_TOKEN_JSON_B64: ${{ secrets.GDRIVE_TOKEN_JSON_B64 }}
         run: |
@@ -68,7 +73,154 @@ jobs:
             --segment-seconds "${{ inputs.tempo_corte }}" \
             --project-folder "${{ inputs.projeto_drive }}" \
             --drive-root "Youtube-Farm-Clips" \
-            --block "${{ matrix.bloco }}" \
+            --block 1 \
             --max-runtime-seconds 20880 \
-            --offline-wait-seconds 180 \
+            --offline-wait-seconds "${{ inputs.tolerancia_queda }}" \
+            --wait-poll-seconds "${{ inputs.intervalo_checagem }}" \
+            --watch-until-iso "${{ inputs.ate_horario }}" \
+            --github-output "$GITHUB_OUTPUT" \
             --temp-dir "/tmp/ci_capture"
+
+  bloco_2:
+    name: "Captura Bloco 2 (${{ inputs.streamer }})"
+    needs: bloco_1
+    if: ${{ always() && needs.bloco_1.outputs.continue_next == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      continue_next: ${{ steps.capture.outputs.continue_next }}
+      stream_seen: ${{ steps.capture.outputs.stream_seen }}
+    env:
+      TZ: America/Sao_Paulo
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install FFmpeg, Streamlink & Drive dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --upgrade -q pip
+          python3 -m pip install -q -r requirements.txt
+      - id: capture
+        name: Capture live segments and upload to Google Drive
+        env:
+          GDRIVE_TOKEN_JSON_B64: ${{ secrets.GDRIVE_TOKEN_JSON_B64 }}
+        run: |
+          mkdir -p /tmp/ci_capture
+          EXTRA_FLAGS=""
+          if [ "${{ needs.bloco_1.outputs.stream_seen }}" = "true" ]; then
+            EXTRA_FLAGS="--stream-already-started"
+          fi
+          timeout -s TERM -k 120s 21360s python3 worker_capture.py \
+            --streamer "${{ inputs.streamer }}" \
+            --quality "${{ inputs.qualidade }}" \
+            --segment-seconds "${{ inputs.tempo_corte }}" \
+            --project-folder "${{ inputs.projeto_drive }}" \
+            --drive-root "Youtube-Farm-Clips" \
+            --block 2 \
+            --max-runtime-seconds 20880 \
+            --offline-wait-seconds "${{ inputs.tolerancia_queda }}" \
+            --wait-poll-seconds "${{ inputs.intervalo_checagem }}" \
+            --watch-until-iso "${{ inputs.ate_horario }}" \
+            --github-output "$GITHUB_OUTPUT" \
+            --temp-dir "/tmp/ci_capture" \
+            $EXTRA_FLAGS
+
+  bloco_3:
+    name: "Captura Bloco 3 (${{ inputs.streamer }})"
+    needs: [bloco_1, bloco_2]
+    if: ${{ always() && inputs.ate_horario != '' && needs.bloco_2.outputs.continue_next == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      continue_next: ${{ steps.capture.outputs.continue_next }}
+      stream_seen: ${{ steps.capture.outputs.stream_seen }}
+    env:
+      TZ: America/Sao_Paulo
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install FFmpeg, Streamlink & Drive dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --upgrade -q pip
+          python3 -m pip install -q -r requirements.txt
+      - id: capture
+        name: Capture live segments and upload to Google Drive
+        env:
+          GDRIVE_TOKEN_JSON_B64: ${{ secrets.GDRIVE_TOKEN_JSON_B64 }}
+        run: |
+          mkdir -p /tmp/ci_capture
+          EXTRA_FLAGS=""
+          if [ "${{ needs.bloco_1.outputs.stream_seen }}" = "true" ] || [ "${{ needs.bloco_2.outputs.stream_seen }}" = "true" ]; then
+            EXTRA_FLAGS="--stream-already-started"
+          fi
+          timeout -s TERM -k 120s 21360s python3 worker_capture.py \
+            --streamer "${{ inputs.streamer }}" \
+            --quality "${{ inputs.qualidade }}" \
+            --segment-seconds "${{ inputs.tempo_corte }}" \
+            --project-folder "${{ inputs.projeto_drive }}" \
+            --drive-root "Youtube-Farm-Clips" \
+            --block 3 \
+            --max-runtime-seconds 20880 \
+            --offline-wait-seconds "${{ inputs.tolerancia_queda }}" \
+            --wait-poll-seconds "${{ inputs.intervalo_checagem }}" \
+            --watch-until-iso "${{ inputs.ate_horario }}" \
+            --github-output "$GITHUB_OUTPUT" \
+            --temp-dir "/tmp/ci_capture" \
+            $EXTRA_FLAGS
+
+  bloco_4:
+    name: "Captura Bloco 4 (${{ inputs.streamer }})"
+    needs: [bloco_1, bloco_2, bloco_3]
+    if: ${{ always() && inputs.ate_horario != '' && needs.bloco_3.outputs.continue_next == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      continue_next: ${{ steps.capture.outputs.continue_next }}
+      stream_seen: ${{ steps.capture.outputs.stream_seen }}
+    env:
+      TZ: America/Sao_Paulo
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install FFmpeg, Streamlink & Drive dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --upgrade -q pip
+          python3 -m pip install -q -r requirements.txt
+      - id: capture
+        name: Capture live segments and upload to Google Drive
+        env:
+          GDRIVE_TOKEN_JSON_B64: ${{ secrets.GDRIVE_TOKEN_JSON_B64 }}
+        run: |
+          mkdir -p /tmp/ci_capture
+          EXTRA_FLAGS=""
+          if [ "${{ needs.bloco_1.outputs.stream_seen }}" = "true" ] || [ "${{ needs.bloco_2.outputs.stream_seen }}" = "true" ] || [ "${{ needs.bloco_3.outputs.stream_seen }}" = "true" ]; then
+            EXTRA_FLAGS="--stream-already-started"
+          fi
+          timeout -s TERM -k 120s 21360s python3 worker_capture.py \
+            --streamer "${{ inputs.streamer }}" \
+            --quality "${{ inputs.qualidade }}" \
+            --segment-seconds "${{ inputs.tempo_corte }}" \
+            --project-folder "${{ inputs.projeto_drive }}" \
+            --drive-root "Youtube-Farm-Clips" \
+            --block 4 \
+            --max-runtime-seconds 20880 \
+            --offline-wait-seconds "${{ inputs.tolerancia_queda }}" \
+            --wait-poll-seconds "${{ inputs.intervalo_checagem }}" \
+            --watch-until-iso "${{ inputs.ate_horario }}" \
+            --github-output "$GITHUB_OUTPUT" \
+            --temp-dir "/tmp/ci_capture" \
+            $EXTRA_FLAGS
